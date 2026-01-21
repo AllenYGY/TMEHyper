@@ -45,12 +45,6 @@
 - [Visualization](#visualization)
 - [Biological Interpretation](#biological-interpretation)
 - [Extending SP-HyperRAE](#extending-sp-hyperrae)
-- [Troubleshooting](#troubleshooting)
-- [FAQ](#faq)
-- [Citation](#citation)
-- [License](#license)
-- [Acknowledgments](#acknowledgments)
-- [Changelog](#changelog)
 
 ---
 
@@ -2326,6 +2320,14 @@ class CustomSPHyperRAE(SPHyperRAE):
 ```
 
 ---
+
+## Data Source
+
+- GSE193460 <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE193460>
+- GSE245582 <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE245582>
+- GSE
+  - <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE221321>
+  - <https://download.brainimagelibrary.org/0c/bd/0cbd479c521afff9/extras/tumors/>
 
 ## Acknowledgments
 
