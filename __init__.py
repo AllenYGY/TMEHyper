@@ -25,6 +25,7 @@ from .encoders import FallbackCellEncoder, ScGPTCellEncoder, ScGPTGuidedFusion
 from .hypergraph import build_semantic_hyperedges, build_spatial_graph
 from .losses import SimpleLoss, SPHyperRAELoss
 from .model import SPHyperRAE
+from .noise_augmentation import NoiseAugmenter
 from .spectral_conv import (
     HypergraphLaplacian,
     MultiLayerSpectralHypergraphEncoder,
@@ -70,4 +71,6 @@ __all__ = [
     "ScGPTCellEncoder",
     "FallbackCellEncoder",
     "ScGPTGuidedFusion",
+    # 噪声增强
+    "NoiseAugmenter",
 ]

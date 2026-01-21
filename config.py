@@ -54,6 +54,14 @@ class Config:
     scgpt_lr_scale = 0.1
     seed = 42
 
+    # ============ 噪声增强 ============
+    use_noise_aug = True
+    noise_logvar_min = -6.0
+    noise_logvar_max = 1.0
+    noise_logvar_target = -2.0
+    noise_weight = 0.01
+    noise_warmup_epochs = 5
+
     # ============ 设备 ============
     device = (
         "mps"

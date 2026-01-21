@@ -80,6 +80,7 @@ from .encoders import (
     ScGPTCellEncoder,
     ScGPTGuidedFusion,
 )
+from .noise_augmentation import NoiseAugmenter
 from .spectral_conv import HypergraphLaplacian, MultiLayerSpectralHypergraphEncoder
 
 
@@ -170,6 +171,20 @@ class SPHyperRAE(nn.Module):
             self.mu_proj = nn.Linear(config.latent_dim, config.latent_dim)
             self.logvar_proj = nn.Linear(config.latent_dim, config.latent_dim)
 
+        # ========== 噪声增强 (可选) ==========
+        self.use_noise_aug = getattr(config, "use_noise_aug", False)
+        if self.use_noise_aug:
+            self.noise_augmenter = NoiseAugmenter(
+                config.latent_dim,
+                logvar_min=getattr(config, "noise_logvar_min", -6.0),
+                logvar_max=getattr(config, "noise_logvar_max", 1.0),
+                logvar_target=getattr(config, "noise_logvar_target", -2.0),
+            )
+            if self.use_vae:
+                print(
+                    "Warning: use_noise_aug and VAE are both enabled; noise may be excessive."
+                )
+
         # ========== 超图拉普拉斯缓存 ==========
         self.L_tilde = None
         self.hyperedge_dict = None
@@ -250,6 +265,7 @@ class SPHyperRAE(nn.Module):
         gene_ids: Optional[torch.Tensor] = None,
         values: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        noise_scale: Optional[float] = None,
         global_center_indices: Optional[torch.Tensor] = None,
         all_expression: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -263,6 +279,7 @@ class SPHyperRAE(nn.Module):
             gene_ids: [batch, seq_len] scGPT基因ID
             values: [batch, seq_len] scGPT表达值
             padding_mask: [batch, seq_len] scGPT padding mask
+            noise_scale: 噪声增强缩放系数（仅训练期生效）
             global_center_indices: [batch] 全局中心节点索引
             all_expression: [N, n_genes] 完整表达矩阵
 
@@ -276,6 +293,7 @@ class SPHyperRAE(nn.Module):
                 'z_tme_post': [batch, tme_embed_dim] 扰动后TME (C1),
                 'mu': VAE均值,
                 'logvar': VAE对数方差,
+                'noise_logvar': 噪声增强的logvar (可选),
                 'hyperedge_features': 超边特征 (用于分析)
             }
         """
@@ -284,6 +302,13 @@ class SPHyperRAE(nn.Module):
 
         # 1. 编码细胞
         z_cell, mu, logvar = self.encode_cell(x, gene_ids, values, padding_mask)
+
+        # 1.1 噪声增强 (训练期)
+        noise_logvar = None
+        if self.use_noise_aug:
+            if noise_scale is None:
+                noise_scale = 1.0
+            z_cell, noise_logvar = self.noise_augmenter(z_cell, noise_scale=noise_scale)
 
         # 2. 编码TME (谱超图卷积)
         if self.use_spectral_conv and all_expression is not None:
@@ -330,6 +355,7 @@ class SPHyperRAE(nn.Module):
             "z_tme_post": decoder_output["z_tme_post"],
             "mu": mu,
             "logvar": logvar,
+            "noise_logvar": noise_logvar,
         }
 
         # 7. 提取超边特征 (用于分析)

@@ -33,20 +33,29 @@ class HypergraphLaplacian:
     - W: 超边权重矩阵
     """
 
-    def __init__(self, n_nodes, hyperedge_dict, node_to_hyperedges):
+    def __init__(self, n_nodes, hyperedge_dict, node_to_hyperedges, verbose=True):
         """
         Args:
             n_nodes: 节点数量
             hyperedge_dict: {type: [set of node indices, ...]}
             node_to_hyperedges: {node_idx: [(type, edge_idx), ...]}
+            verbose: 是否打印进度
         """
         self.n_nodes = n_nodes
         self.hyperedge_dict = hyperedge_dict
         self.node_to_hyperedges = node_to_hyperedges
+        self.verbose = verbose
 
         # 构建关联矩阵和拉普拉斯
+        if self.verbose:
+            print("  构建超图关联矩阵...", end=" ", flush=True)
         self._build_incidence_matrix()
+        if self.verbose:
+            print(f"完成 ({self.n_nodes} 节点, {self.n_edges} 超边)")
+            print("  构建拉普拉斯矩阵...", end=" ", flush=True)
         self._build_laplacian()
+        if self.verbose:
+            print("完成")
 
     def _build_incidence_matrix(self):
         """构建超图关联矩阵 H"""
@@ -66,13 +75,18 @@ class HypergraphLaplacian:
             self.H = eye(self.n_nodes, format="csr")
             return
 
-        # 构建稀疏关联矩阵
-        rows, cols, data = [], [], []
+        # 预计算总非零元素数量，使用numpy数组（更快）
+        total_nnz = sum(len(e) for e in all_edges)
+        rows = np.zeros(total_nnz, dtype=np.int32)
+        cols = np.zeros(total_nnz, dtype=np.int32)
+        data = np.ones(total_nnz, dtype=np.float32)
+
+        idx = 0
         for edge_idx, edge_nodes in enumerate(all_edges):
-            for node_idx in edge_nodes:
-                rows.append(node_idx)
-                cols.append(edge_idx)
-                data.append(1.0)
+            n_nodes_in_edge = len(edge_nodes)
+            rows[idx : idx + n_nodes_in_edge] = list(edge_nodes)
+            cols[idx : idx + n_nodes_in_edge] = edge_idx
+            idx += n_nodes_in_edge
 
         self.H = csr_matrix((data, (rows, cols)), shape=(self.n_nodes, self.n_edges))
 
@@ -111,8 +125,8 @@ class HypergraphLaplacian:
         # 使用幂迭代法近似
         self.lambda_max = self._estimate_lambda_max()
 
-    def _estimate_lambda_max(self, n_iter=50):
-        """幂迭代法估计最大特征值"""
+    def _estimate_lambda_max(self, n_iter=20):
+        """幂迭代法估计最大特征值（减少迭代次数加速）"""
         x = np.random.randn(self.n_nodes)
         x = x / np.linalg.norm(x)
 
@@ -140,8 +154,9 @@ class HypergraphLaplacian:
 
         # 转换为COO格式
         L_coo = L_scaled.tocoo()
-        indices = torch.LongTensor([L_coo.row, L_coo.col])
-        values = torch.FloatTensor(L_coo.data)
+        # 先转换为numpy数组再创建tensor，避免警告
+        indices = torch.LongTensor(np.array([L_coo.row, L_coo.col]))
+        values = torch.FloatTensor(np.asarray(L_coo.data))
 
         L_torch = torch.sparse_coo_tensor(
             indices, values, size=(self.n_nodes, self.n_nodes)
@@ -340,12 +355,82 @@ class MultiLayerSpectralHypergraphEncoder(nn.Module):
             nn.Linear(self.hidden_dim, config.tme_embed_dim),
         )
 
-        # 缓存拉普拉斯矩阵
+        # 缓存拉普拉斯矩阵（保存在CPU上以节省GPU内存）
         self.L_tilde = None
+        self.L_tilde_cpu = None
+
+        # 预计算的谱特征缓存
+        self.cached_h = None  # [N, hidden_dim]
+        self.cached_h_low = None  # [N, freq_dim]
+        self.cached_h_high = None  # [N, freq_dim]
+        self.cache_valid = False
+        self.use_cached_features = False  # 是否使用缓存特征
 
     def set_laplacian(self, L_tilde):
-        """设置拉普拉斯矩阵"""
+        """设置拉普拉斯矩阵（保存在CPU上）"""
+        # 保存CPU版本用于大规模计算
+        self.L_tilde_cpu = L_tilde.cpu() if L_tilde.device.type != "cpu" else L_tilde
         self.L_tilde = L_tilde
+        # 设置新拉普拉斯时使缓存失效
+        self.cache_valid = False
+
+    def precompute_spectral_features(self, x, device="cpu"):
+        """
+        预计算所有节点的谱特征（在每个epoch开始时调用）
+
+        这允许在大规模图上高效训练：谱卷积在CPU上预计算，
+        训练时只需查找batch节点的特征
+
+        Args:
+            x: [N, in_dim] 全部节点特征
+            device: 计算设备（建议使用'cpu'以节省GPU内存）
+        """
+        print("  预计算谱特征...", end=" ", flush=True)
+
+        x_cpu = x.detach().cpu() if x.device.type != "cpu" else x.detach()
+
+        # 将模型暂时移到CPU
+        original_device = next(self.parameters()).device
+        self.cpu()
+
+        with torch.no_grad():
+            # 输入投影
+            h = self.input_proj(x_cpu)
+
+            # 多层谱卷积
+            all_h_low = []
+            all_h_high = []
+
+            for layer in self.spectral_layers:
+                h, h_low, h_high = layer(h, self.L_tilde_cpu)
+                all_h_low.append(h_low)
+                all_h_high.append(h_high)
+
+            # 缓存结果
+            self.cached_h = h.detach()
+            self.cached_h_low = all_h_low[-1].detach()
+            self.cached_h_high = all_h_high[-1].detach()
+            self.cache_valid = True
+
+        # 将模型移回原设备
+        self.to(original_device)
+
+        print(f"完成 (缓存 {x_cpu.size(0)} 节点的谱特征)")
+
+    def enable_cached_mode(self, enable=True):
+        """启用/禁用缓存模式"""
+        self.use_cached_features = enable
+        if enable and not self.cache_valid:
+            print(
+                "警告: 缓存模式已启用但缓存无效，请先调用 precompute_spectral_features()"
+            )
+
+    def invalidate_cache(self):
+        """使缓存失效"""
+        self.cache_valid = False
+        self.cached_h = None
+        self.cached_h_low = None
+        self.cached_h_high = None
 
     def apply_scgpt_guidance(self, h, scgpt_emb):
         """scGPT引导融合"""
@@ -380,9 +465,21 @@ class MultiLayerSpectralHypergraphEncoder(nn.Module):
             h_low: [batch, freq_dim] 低频特征
             h_high: [batch, freq_dim] 高频特征
         """
-        if self.L_tilde is None:
+        if self.L_tilde_cpu is None:
             raise ValueError("请先调用 set_laplacian() 设置拉普拉斯矩阵")
 
+        device = x.device
+        n_nodes = x.size(0)
+
+        # 如果有缓存的谱特征，直接使用（大规模数据的高效路径）
+        if self.use_cached_features and self.cache_valid:
+            return self._forward_with_cache(center_indices, scgpt_emb, device)
+
+        # 大规模数据：在CPU上计算谱卷积，只把batch结果移到GPU
+        if n_nodes > 10000:
+            return self._forward_cpu_efficient(x, center_indices, scgpt_emb)
+
+        # 小规模数据：直接在GPU上计算
         # 输入投影
         h = self.input_proj(x)
 
@@ -409,6 +506,92 @@ class MultiLayerSpectralHypergraphEncoder(nn.Module):
             center_h = self.apply_scgpt_guidance(center_h, scgpt_emb)
 
         # 输出投影
+        z_tme = self.output_proj(center_h)
+
+        return z_tme, center_h_low, center_h_high
+
+    def _forward_with_cache(self, center_indices, scgpt_emb, device):
+        """
+        使用预计算缓存的高效前向传播
+
+        只需查找batch节点的特征，无需重新计算谱卷积
+        """
+        # 从缓存中提取batch节点特征
+        center_indices_cpu = (
+            center_indices.cpu()
+            if center_indices.device.type != "cpu"
+            else center_indices
+        )
+
+        center_h = self.cached_h[center_indices_cpu].to(device)
+        center_h_low = self.cached_h_low[center_indices_cpu].to(device)
+        center_h_high = self.cached_h_high[center_indices_cpu].to(device)
+
+        # scGPT引导（在GPU上，可训练）
+        if scgpt_emb is not None:
+            center_h = self.apply_scgpt_guidance(center_h, scgpt_emb)
+
+        # 输出投影（在GPU上，可训练）
+        z_tme = self.output_proj(center_h)
+
+        return z_tme, center_h_low, center_h_high
+
+    def _forward_cpu_efficient(self, x, center_indices, scgpt_emb=None):
+        """
+        内存高效版本：在CPU上计算谱卷积
+
+        Args:
+            x: [N, in_dim] 全部节点特征（在GPU上）
+            center_indices: [batch] 中心节点索引
+            scgpt_emb: [batch, scgpt_dim] scGPT嵌入
+        """
+        device = x.device
+
+        # 将数据移到CPU进行谱卷积
+        x_cpu = x.detach().cpu()
+
+        # 输入投影（在CPU上）
+        with torch.no_grad():
+            # 临时将模型部分移到CPU
+            input_proj_cpu = self.input_proj.cpu()
+            h_cpu = input_proj_cpu(x_cpu)
+
+            # 多层谱卷积（在CPU上）
+            spectral_layers_cpu = [layer.cpu() for layer in self.spectral_layers]
+
+            all_h_low_cpu = []
+            all_h_high_cpu = []
+
+            for layer in spectral_layers_cpu:
+                h_cpu, h_low_cpu, h_high_cpu = layer(h_cpu, self.L_tilde_cpu)
+                all_h_low_cpu.append(h_low_cpu)
+                all_h_high_cpu.append(h_high_cpu)
+
+            # 取最后一层的频率特征
+            final_h_low_cpu = all_h_low_cpu[-1]
+            final_h_high_cpu = all_h_high_cpu[-1]
+
+            # 只提取batch需要的节点（在CPU上）
+            center_indices_cpu = center_indices.cpu()
+            center_h_cpu = h_cpu[center_indices_cpu]
+            center_h_low_cpu = final_h_low_cpu[center_indices_cpu]
+            center_h_high_cpu = final_h_high_cpu[center_indices_cpu]
+
+            # 将模型移回GPU
+            self.input_proj.to(device)
+            for i, layer in enumerate(self.spectral_layers):
+                layer.to(device)
+
+        # 将batch结果移到GPU，启用梯度
+        center_h = center_h_cpu.to(device).requires_grad_(True)
+        center_h_low = center_h_low_cpu.to(device)
+        center_h_high = center_h_high_cpu.to(device)
+
+        # scGPT引导（在GPU上）
+        if scgpt_emb is not None:
+            center_h = self.apply_scgpt_guidance(center_h, scgpt_emb)
+
+        # 输出投影（在GPU上）
         z_tme = self.output_proj(center_h)
 
         return z_tme, center_h_low, center_h_high

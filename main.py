@@ -173,6 +173,10 @@ def main():
         config.use_spectral_conv = False
         config.use_true_hypergraph = False
 
+    if config.use_spectral_conv and config.device == "mps":
+        print("检测到 MPS + 谱超图卷积，自动切换到 CPU 以避免稀疏张量限制")
+        config.device = "cpu"
+
     print("\n配置:")
     print(f"  数据文件: {config.data_file}")
     print(f"  训练轮数: {config.epochs}")
@@ -303,27 +307,31 @@ def print_usage():
     """打印使用说明"""
     print("""
 ============================================================
-                    SP-HyperRAE 使用说明
+SP-HyperRAE 使用说明
 ============================================================
 
-1. 基础运行:
+1. 基础运行（默认启用谱超图卷积 + 语义超边；有 cell_type 才能构建超边）:
     python -m sp_hyperrae.main --data GSE193460.h5ad
 
-2. 使用谱超图卷积 (A1):
+2. 使用谱超图卷积 (A1)（默认已启用，仅在你手动关闭后可用于强制开启）:
     python -m sp_hyperrae.main --data GSE193460.h5ad --use_spectral
 
-3. 使用超边对比学习 (B1+B2+B3):
+3. 使用完整损失（超边存在时包含 B1+B2+B3；无超边则对比项为 0）:
     python -m sp_hyperrae.main --data GSE193460.h5ad --use_contrast
 
-4. 完整功能:
+4. 完整功能（= 默认功能 + 训练更久）:
     python -m sp_hyperrae.main --data GSE193460.h5ad --use_spectral --use_contrast --epochs 100
 
-5. 简化版（不使用超图）:
+5. 简化版（不使用超图/谱卷积）:
     python -m sp_hyperrae.main --data GSE193460.h5ad --simple
 
 配置scGPT:
-- 下载预训练模型到 scGPT/save/scGPT_human/
+- 默认模型目录: ../scGPT/save/scGPT_human/（可在 config.py 修改）
 - 需要的文件: vocab.json, args.json, best_model.pt
+
+注意:
+- 如果使用 MPS + 谱超图卷积，会自动切到 CPU 以避免稀疏张量限制
+- 也可直接运行: python main.py --data GSE193460.h5ad
 
 ============================================================
 """)

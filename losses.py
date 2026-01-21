@@ -137,6 +137,8 @@ class SPHyperRAELoss(nn.Module):
         self.kl_weight = config.kl_weight
         self.tme_diversity_weight = config.tme_diversity_weight
         self.freq_weight = config.freq_weight
+        self.noise_weight = getattr(config, "noise_weight", 0.0)
+        self.noise_logvar_target = getattr(config, "noise_logvar_target", -2.0)
 
     def forward(
         self,
@@ -149,6 +151,7 @@ class SPHyperRAELoss(nn.Module):
         h_high: Optional[torch.Tensor] = None,
         z_nodes: Optional[torch.Tensor] = None,
         hyperedge_dict: Optional[Dict[str, List[Set[int]]]] = None,
+        noise_logvar: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         计算所有损失
@@ -211,6 +214,13 @@ class SPHyperRAELoss(nn.Module):
             losses['type'] = torch.tensor(0.0, device=device)
             losses['inter'] = torch.tensor(0.0, device=device)
 
+        # ============ 噪声正则 ============
+        if noise_logvar is not None and self.noise_weight > 0:
+            target = torch.full_like(noise_logvar, self.noise_logvar_target)
+            losses['noise'] = F.mse_loss(noise_logvar, target)
+        else:
+            losses['noise'] = torch.tensor(0.0, device=device)
+
         # ============ 加权总损失 ============
         total = (
             self.recon_weight * losses['recon'] +
@@ -219,7 +229,8 @@ class SPHyperRAELoss(nn.Module):
             self.freq_weight * losses['freq'] +
             self.config.intra_weight * losses['intra'] +
             self.config.type_weight * losses['type'] +
-            self.config.inter_weight * losses['inter']
+            self.config.inter_weight * losses['inter'] +
+            self.noise_weight * losses['noise']
         )
 
         losses['total'] = total
@@ -240,6 +251,8 @@ class SimpleLoss(nn.Module):
         self.recon_loss = ReconstructionLoss()
         self.kl_loss = KLDivergenceLoss()
         self.tme_diversity_loss = TMEDiversityLoss()
+        self.noise_weight = getattr(config, "noise_weight", 0.0)
+        self.noise_logvar_target = getattr(config, "noise_logvar_target", -2.0)
 
     def forward(
         self,
@@ -248,6 +261,7 @@ class SimpleLoss(nn.Module):
         mu: Optional[torch.Tensor] = None,
         logvar: Optional[torch.Tensor] = None,
         z_tme: Optional[torch.Tensor] = None,
+        noise_logvar: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         计算简化损失
@@ -279,11 +293,19 @@ class SimpleLoss(nn.Module):
         else:
             losses['tme_diversity'] = torch.tensor(0.0, device=device)
 
+        # 噪声正则
+        if noise_logvar is not None and self.noise_weight > 0:
+            target = torch.full_like(noise_logvar, self.noise_logvar_target)
+            losses['noise'] = F.mse_loss(noise_logvar, target)
+        else:
+            losses['noise'] = torch.tensor(0.0, device=device)
+
         # 总损失
         total = (
             self.config.recon_weight * losses['recon'] +
             self.config.kl_weight * losses['kl'] +
-            self.config.tme_diversity_weight * losses['tme_diversity']
+            self.config.tme_diversity_weight * losses['tme_diversity'] +
+            self.noise_weight * losses['noise']
         )
 
         losses['total'] = total

@@ -107,7 +107,7 @@ def build_spatial_graph(
     return torch.LongTensor(edge_index), torch.FloatTensor(edge_attr), adj_list
 
 
-def estimate_dbscan_eps(coords: np.ndarray, k: int = 15, percentile: int = 50) -> float:
+def estimate_dbscan_eps(coords: np.ndarray, k: int = 15, percentile: int = 70) -> float:
     """
     自动估计DBSCAN的eps参数
 
@@ -123,9 +123,15 @@ def estimate_dbscan_eps(coords: np.ndarray, k: int = 15, percentile: int = 50) -
     """
     nbrs = NearestNeighbors(n_neighbors=k).fit(coords)
     distances, _ = nbrs.kneighbors(coords)
-    # 取第k个邻居的距离的中位数作为eps
+    # 取第k个邻居的距离作为eps
     k_distances = distances[:, -1]
     eps = np.percentile(k_distances, percentile)
+
+    # 添加最小eps阈值：基于坐标范围的2%
+    coord_range = np.max(coords, axis=0) - np.min(coords, axis=0)
+    min_eps = np.mean(coord_range) * 0.02
+    eps = max(eps, min_eps)
+
     return eps
 
 
@@ -290,19 +296,19 @@ def build_semantic_hyperedges(
     }
     node_to_hyperedges = {i: [] for i in range(n_cells)}
 
-    # 超边参数
-    min_samples = getattr(config, "hyperedge_min_samples", 5)
+    # 超边参数 - 降低min_samples以适应稀疏数据
+    min_samples = getattr(config, "hyperedge_min_samples", 3)
 
     # 自动估计eps或使用配置
     if auto_eps:
-        eps = estimate_dbscan_eps(coords, k=15, percentile=30)
+        eps = estimate_dbscan_eps(coords, k=15, percentile=70)
         print(f"\n自动估计 DBSCAN eps: {eps:.2f}")
     else:
         eps = getattr(config, "hyperedge_eps", 100)
         print(f"\n使用配置 DBSCAN eps: {eps}")
 
-    # 更细粒度的bins分层
-    bins = [0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]
+    # 使用更粗的bins分层，减少数据分割
+    bins = [0, 0.01, 0.1, 0.3, 1.0]
 
     # ========== 1. T Cell Contact超边 ==========
     print("\n构建 T_contact 超边...")
@@ -345,10 +351,25 @@ def build_semantic_hyperedges(
     )
 
     # ========== 4. Spatial超边 (K近邻) ==========
-    print("构建 Spatial 超边...")
-    _build_spatial_hyperedges(
-        adj_list, hyperedge_dict, node_to_hyperedges, min_neighbors=3
-    )
+    # 对于大数据集，跳过spatial超边（空间关系已被K近邻图捕获）
+    max_cells_for_spatial = getattr(config, "max_cells_for_spatial_hyperedge", 50000)
+    if n_cells <= max_cells_for_spatial:
+        print("构建 Spatial 超边...")
+        _build_spatial_hyperedges(
+            adj_list, hyperedge_dict, node_to_hyperedges, min_neighbors=3
+        )
+    else:
+        print(
+            f"跳过 Spatial 超边 (细胞数 {n_cells} > {max_cells_for_spatial}，使用语义超边)"
+        )
+        # 对大数据集，可以采样构建少量spatial超边
+        _build_sampled_spatial_hyperedges(
+            adj_list,
+            hyperedge_dict,
+            node_to_hyperedges,
+            n_samples=min(1000, n_cells // 100),
+            min_neighbors=3,
+        )
 
     # 统计
     print("\n超边构建完成:")
@@ -381,7 +402,7 @@ def _build_ratio_based_hyperedges(
     sample_labels: np.ndarray = None,
 ):
     """
-    按比例分层构建超边（按样本分开聚类）
+    按比例分层构建超边（按样本分开聚类，带回退机制）
 
     Args:
         min_ratio_threshold: 最小比例阈值，低于此值的细胞不参与构建
@@ -418,6 +439,7 @@ def _build_ratio_based_hyperedges(
             bin_mask = (ratios >= low) & (ratios < high)
 
         bin_total_clusters = 0
+        n_bin_total = bin_mask.sum()
 
         # 按样本分开聚类
         for sample in unique_samples:
@@ -452,12 +474,67 @@ def _build_ratio_based_hyperedges(
                     total_edges += 1
                     bin_total_clusters += 1
 
-        # 调试信息
-        if bin_total_clusters > 0:
-            n_in_bin = bin_mask.sum()
-            print(
-                f"    bin [{low:.2f}, {high:.2f}): {n_in_bin} 细胞 -> {bin_total_clusters} 簇"
+        # 回退机制：如果按样本聚类失败，尝试整体聚类（忽略样本边界）
+        if bin_total_clusters == 0 and n_bin_total >= min_samples:
+            bin_indices = np.where(bin_mask)[0]
+            bin_coords = coords[bin_mask]
+
+            # 尝试更大的eps
+            larger_eps = eps * 2.0
+            clustering = DBSCAN(eps=larger_eps, min_samples=min_samples).fit(bin_coords)
+            n_clusters = (
+                max(clustering.labels_) + 1
+                if len(set(clustering.labels_)) > 1 or clustering.labels_[0] != -1
+                else 0
             )
+
+            for c in range(n_clusters):
+                c_mask = clustering.labels_ == c
+                if c_mask.sum() >= min_samples:
+                    edge_nodes = set(bin_indices[c_mask].tolist())
+                    edge_idx = len(hyperedge_dict[edge_type])
+                    hyperedge_dict[edge_type].append(edge_nodes)
+                    for node in edge_nodes:
+                        node_to_hyperedges[node].append((edge_type, edge_idx))
+                    total_edges += 1
+                    bin_total_clusters += 1
+
+            if bin_total_clusters > 0:
+                print(
+                    f"    bin [{low:.2f}, {high:.2f}): {n_bin_total} 细胞 -> {bin_total_clusters} 簇 (回退模式)"
+                )
+
+        # 调试信息
+        if bin_total_clusters > 0 and n_bin_total > 0:
+            print(
+                f"    bin [{low:.2f}, {high:.2f}): {n_bin_total} 细胞 -> {bin_total_clusters} 簇"
+            )
+
+    # 最终回退：如果仍然没有超边，基于K近邻构建
+    if total_edges == 0 and n_valid >= min_samples:
+        print("    DBSCAN失败，使用K近邻回退...")
+        valid_indices = np.where(valid_mask)[0]
+        valid_coords = coords[valid_mask]
+
+        # 使用K近邻构建超边
+        k = min(15, n_valid - 1)
+        if k >= min_samples:
+            nbrs = NearestNeighbors(n_neighbors=k).fit(valid_coords)
+            _, indices = nbrs.kneighbors(valid_coords)
+
+            # 每隔一定数量的细胞创建一个超边
+            step = max(1, n_valid // 50)  # 最多创建50个超边
+            for idx in range(0, n_valid, step):
+                neighbor_local_indices = indices[idx]
+                edge_nodes = set(valid_indices[neighbor_local_indices].tolist())
+                if len(edge_nodes) >= min_samples:
+                    edge_idx = len(hyperedge_dict[edge_type])
+                    hyperedge_dict[edge_type].append(edge_nodes)
+                    for node in edge_nodes:
+                        node_to_hyperedges[node].append((edge_type, edge_idx))
+                    total_edges += 1
+
+        print(f"    K近邻回退: {total_edges} 超边")
 
     if total_edges == 0:
         print(f"    未能构建任何超边 (有效细胞: {n_valid})")
@@ -472,7 +549,7 @@ def _build_interface_hyperedges(
     node_to_hyperedges: Dict,
     sample_labels: np.ndarray = None,
 ):
-    """构建界面超边（按样本分开聚类）"""
+    """构建界面超边（按样本分开聚类，带回退机制）"""
     interface_mask = is_interface > 0.5
     n_interface = interface_mask.sum()
 
@@ -518,7 +595,64 @@ def _build_interface_hyperedges(
                     node_to_hyperedges[node].append(("interface", edge_idx))
                 total_clusters += 1
 
-    print(f"    Interface: {n_interface} 细胞 -> {total_clusters} 簇")
+    # 回退机制：如果按样本聚类失败，尝试整体聚类
+    if total_clusters == 0 and n_interface >= min_samples:
+        interface_indices = np.where(interface_mask)[0]
+        interface_coords = coords[interface_mask]
+
+        # 尝试更大的eps
+        larger_eps = eps * 2.0
+        clustering = DBSCAN(eps=larger_eps, min_samples=min_samples).fit(
+            interface_coords
+        )
+        n_clusters = (
+            max(clustering.labels_) + 1
+            if len(set(clustering.labels_)) > 1 or clustering.labels_[0] != -1
+            else 0
+        )
+
+        for c in range(n_clusters):
+            c_mask = clustering.labels_ == c
+            if c_mask.sum() >= min_samples:
+                edge_nodes = set(interface_indices[c_mask].tolist())
+                edge_idx = len(hyperedge_dict["interface"])
+                hyperedge_dict["interface"].append(edge_nodes)
+                for node in edge_nodes:
+                    node_to_hyperedges[node].append(("interface", edge_idx))
+                total_clusters += 1
+
+        if total_clusters > 0:
+            print(
+                f"    Interface: {n_interface} 细胞 -> {total_clusters} 簇 (回退模式)"
+            )
+
+    # 最终回退：使用K近邻
+    if total_clusters == 0 and n_interface >= min_samples:
+        interface_indices = np.where(interface_mask)[0]
+        interface_coords = coords[interface_mask]
+
+        k = min(15, n_interface - 1)
+        if k >= min_samples:
+            nbrs = NearestNeighbors(n_neighbors=k).fit(interface_coords)
+            _, indices = nbrs.kneighbors(interface_coords)
+
+            step = max(1, n_interface // 20)
+            for idx in range(0, n_interface, step):
+                neighbor_local_indices = indices[idx]
+                edge_nodes = set(interface_indices[neighbor_local_indices].tolist())
+                if len(edge_nodes) >= min_samples:
+                    edge_idx = len(hyperedge_dict["interface"])
+                    hyperedge_dict["interface"].append(edge_nodes)
+                    for node in edge_nodes:
+                        node_to_hyperedges[node].append(("interface", edge_idx))
+                    total_clusters += 1
+
+        print(f"    Interface: {n_interface} 细胞 -> {total_clusters} 簇 (K近邻回退)")
+
+    if total_clusters == 0:
+        print(f"    Interface: {n_interface} 细胞 -> 0 簇")
+    elif "回退" not in str(total_clusters):
+        print(f"    Interface: {n_interface} 细胞 -> {total_clusters} 簇")
 
 
 def _build_spatial_hyperedges(
@@ -537,6 +671,38 @@ def _build_spatial_hyperedges(
             hyperedge_dict["spatial"].append(edge_nodes)
             for node in edge_nodes:
                 node_to_hyperedges[node].append(("spatial", edge_idx))
+
+
+def _build_sampled_spatial_hyperedges(
+    adj_list: List[List[int]],
+    hyperedge_dict: Dict,
+    node_to_hyperedges: Dict,
+    n_samples: int = 1000,
+    min_neighbors: int = 3,
+):
+    """构建采样的空间邻近超边（用于大数据集）"""
+    n_cells = len(adj_list)
+
+    # 均匀采样细胞索引
+    if n_samples >= n_cells:
+        sample_indices = range(n_cells)
+    else:
+        sample_indices = np.random.choice(n_cells, n_samples, replace=False)
+
+    count = 0
+    for i in sample_indices:
+        neighbors = adj_list[i]
+        if len(neighbors) >= min_neighbors:
+            edge_nodes = set([i] + list(neighbors))
+            edge_idx = len(hyperedge_dict["spatial"])
+            hyperedge_dict["spatial"].append(edge_nodes)
+            for node in edge_nodes:
+                node_to_hyperedges[node].append(("spatial", edge_idx))
+            count += 1
+
+    print(
+        f"    采样 Spatial 超边: {count} 个 (从 {n_cells} 细胞中采样 {len(sample_indices)} 个)"
+    )
 
 
 class LocalGraphExtractor:

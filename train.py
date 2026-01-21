@@ -123,6 +123,12 @@ def train_model(
     history = []
 
     for epoch in range(config.epochs):
+        noise_scale = 1.0
+        if getattr(config, "use_noise_aug", False):
+            warmup_epochs = getattr(config, "noise_warmup_epochs", 0)
+            if warmup_epochs and warmup_epochs > 0:
+                noise_scale = min(1.0, (epoch + 1) / warmup_epochs)
+
         total_losses = {}
 
         pbar = tqdm(
@@ -157,6 +163,7 @@ def train_model(
                 gene_ids=gene_ids,
                 values=values,
                 padding_mask=padding_mask,
+                noise_scale=noise_scale,
                 global_center_indices=global_center_indices,
                 all_expression=all_expression,
             )
@@ -176,6 +183,7 @@ def train_model(
                     h_high=output.get("h_high"),
                     z_nodes=z_nodes,
                     hyperedge_dict=hyperedge_dict,
+                    noise_logvar=output.get("noise_logvar"),
                 )
             else:
                 losses = loss_fn(
@@ -184,6 +192,7 @@ def train_model(
                     mu=output.get("mu"),
                     logvar=output.get("logvar"),
                     z_tme=output.get("z_tme"),
+                    noise_logvar=output.get("noise_logvar"),
                 )
 
             loss = losses["total"]

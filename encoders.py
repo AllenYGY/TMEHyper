@@ -10,17 +10,17 @@
 
 import os
 import sys
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # 尝试导入scGPT
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'scGPT'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "scGPT"))
 
 try:
     from scgpt.model import TransformerModel
     from scgpt.tokenizer import GeneVocab
-    from scgpt.utils import load_pretrained
+
     SCGPT_AVAILABLE = True
 except ImportError:
     SCGPT_AVAILABLE = False
@@ -198,17 +198,11 @@ class ScGPTGuidedFusion(nn.Module):
 
         # 跨注意力
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=small_dim,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True
+            embed_dim=small_dim, num_heads=n_heads, dropout=dropout, batch_first=True
         )
 
         # 门控融合
-        self.gate = nn.Sequential(
-            nn.Linear(small_dim * 2, small_dim),
-            nn.Sigmoid()
-        )
+        self.gate = nn.Sequential(nn.Linear(small_dim * 2, small_dim), nn.Sigmoid())
 
         # 输出投影
         self.output_proj = nn.Sequential(

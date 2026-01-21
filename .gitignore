@@ -1,3 +1,10 @@
 .DS_Store
 data/*
+!data/GSE193460.h5ad
 docs/*
+__pycache__/
+noise_eval_results/*
+sp_hyperrae_results/*
+sp_hyperrae_results_/*
+scripts/*
+draw/*
